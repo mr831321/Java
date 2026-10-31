@@ -1,0 +1,51 @@
+# Base44 sandbox environment for TheAlgorithms/Java.
+#
+# This repository is a Maven *library* (algorithm implementations plus JUnit
+# tests). It has no application server of its own, so the `preview` service does
+# two things on every start:
+#   1. builds the library from this checkout with the project's own Maven build
+#      (nothing is baked into an image, so edits in src/main/java are picked up
+#      on restart),
+#   2. compiles and runs `.base44/preview/PreviewServer.java.in` against
+#      target/classes — a small harness that exposes a page on port 3000 where
+#      every card calls the real implementation from src/main/java.
+#
+# The harness file uses the `.java.in` extension on purpose: the repository's
+# ProjectStructure CI check fails on any `*.java` file outside
+# src/main/java/com/thealgorithms or src/test/java/com/thealgorithms.
+
+services:
+  preview:
+    image: maven:3.9-eclipse-temurin-21
+    working_dir: /app
+    restart: on-failure
+    labels:
+      base44.project: "TheAlgorithms / Java"
+      base44.kind: "web"
+      base44.port: "3000"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./:/app
+      - maven-repo:/root/.m2
+    command:
+      - sh
+      - -ec
+      - |
+        cp /app/.base44/preview/PreviewServer.java.in /tmp/PreviewServer.java
+        mvn --batch-mode --quiet compile
+        rm -rf /tmp/preview-classes
+        javac -d /tmp/preview-classes -cp /app/target/classes /tmp/PreviewServer.java
+        exec java -cp /tmp/preview-classes:/app/target/classes PreviewServer
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          bash -c 'exec 3<>/dev/tcp/127.0.0.1/3000; printf "GET /health HTTP/1.0\r\n\r\n" >&3; grep -q "200 OK" <&3'
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 300s
+
+volumes:
+  maven-repo:

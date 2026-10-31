@@ -1,0 +1,336 @@
+// Base44 sandbox preview harness for TheAlgorithms/Java.
+//
+// This repository is a library, so there is nothing to "serve" as-is. This file
+// lives outside the Maven build on purpose (see docker-compose.base44.yml): it is
+// copied to /tmp, compiled against the freshly built target/classes, and run on
+// port 3000. Every demo below calls a real, public implementation from
+// src/main/java, so the page shows the library actually working.
+//
+// Keep the extension `.java.in`: the repository's ProjectStructure CI check
+// rejects any `*.java` file outside src/main/java|src/test/java/com/thealgorithms.
+
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+
+import com.thealgorithms.ciphers.Caesar;
+import com.thealgorithms.ciphers.Vigenere;
+import com.thealgorithms.maths.Factorial;
+import com.thealgorithms.maths.GCD;
+import com.thealgorithms.searches.IterativeBinarySearch;
+import com.thealgorithms.sorts.HeapSort;
+import com.thealgorithms.strings.Anagrams;
+import com.thealgorithms.strings.ReverseString;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.InetSocketAddress;
+import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.concurrent.Executors;
+
+public final class PreviewServer {
+
+    private static final int PORT = 3000;
+
+    private interface Processor {
+        String process(String input) throws Exception;
+    }
+
+    private record Demo(String id, String title, String source, String description, String sample, Processor run) {
+    }
+
+    private static final List<Demo> DEMOS = new ArrayList<>();
+
+    static {
+        DEMOS.add(new Demo("heapsort", "Heap sort", "sorts/HeapSort.java",
+            "Builds a max-heap and sorts a list of integers ascending, in place.", "5, 3, 9, 1, 7, 2, 8", input -> {
+                Integer[] sorted = new HeapSort().sort(parseInts(input));
+                return Arrays.toString(sorted);
+            }));
+
+        DEMOS.add(new Demo("binarysearch", "Binary search", "searches/IterativeBinarySearch.java",
+            "Finds a key in a sorted array. Format: key | sorted numbers", "7 | 1, 3, 5, 7, 9, 11", input -> {
+                String[] pair = splitPair(input);
+                Integer key = Integer.valueOf(pair[0]);
+                Integer[] values = parseInts(pair[1]);
+                int index = new IterativeBinarySearch().find(values, key);
+                return index >= 0 ? "found at index " + index : "not found (returns -1)";
+            }));
+
+        DEMOS.add(new Demo("anagrams", "Anagrams", "strings/Anagrams.java",
+            "Compares letter counts of two phrases. Format: first | second", "listen | silent", input -> {
+                String[] pair = splitPair(input);
+                boolean result = Anagrams.areAnagramsByCountingChars(pair[0], pair[1]);
+                return "are " + (result ? "" : "not ") + "anagrams";
+            }));
+
+        DEMOS.add(new Demo("reverse", "Reverse string", "strings/ReverseString.java",
+            "Reverses the characters of any text.", "TheAlgorithms", input -> ReverseString.reverse(input)));
+
+        DEMOS.add(new Demo("caesar", "Caesar cipher", "ciphers/Caesar.java",
+            "Shifts Latin letters by a fixed amount, then decodes back. Format: text | shift", "HELLO WORLD | 3",
+            input -> {
+                String[] pair = splitPair(input);
+                int shift = Integer.parseInt(pair[1]);
+                Caesar caesar = new Caesar();
+                String encoded = caesar.encode(pair[0], shift);
+                return encoded + "   (round-trip: " + caesar.decode(encoded, shift) + ")";
+            }));
+
+        DEMOS.add(new Demo("vigenere", "Vigenere cipher", "ciphers/Vigenere.java",
+            "Polyalphabetic cipher with a keyword. Format: text | keyword", "Hello World! | suchsecret", input -> {
+                String[] pair = splitPair(input);
+                Vigenere vigenere = new Vigenere();
+                String encrypted = vigenere.encrypt(pair[0], pair[1]);
+                return encrypted + "   (round-trip: " + vigenere.decrypt(encrypted, pair[1]) + ")";
+            }));
+
+        DEMOS.add(new Demo("gcd", "Greatest common divisor", "maths/GCD.java",
+            "Euclid's algorithm on two integers. Format: first | second", "48 | 18", input -> {
+                String[] pair = splitPair(input);
+                int a = Integer.parseInt(pair[0]);
+                int b = Integer.parseInt(pair[1]);
+                return "gcd(" + a + ", " + b + ") = " + GCD.gcd(a, b);
+            }));
+
+        DEMOS.add(new Demo("factorial", "Factorial", "maths/Factorial.java",
+            "BigInteger factorial of a non-negative integer.", "25",
+            input -> Integer.parseInt(input.trim()) + "! = " + Factorial.factorial(Integer.parseInt(input.trim()))));
+    }
+
+    private PreviewServer() {
+    }
+
+    public static void main(String[] args) throws IOException {
+        HttpServer server = HttpServer.create(new InetSocketAddress(PORT), 0);
+        server.createContext("/", PreviewServer::handleRoot);
+        server.createContext("/api/run", PreviewServer::handleRun);
+        server.createContext("/health", exchange -> respond(exchange, 200, "text/plain; charset=utf-8", "ok"));
+        server.setExecutor(Executors.newFixedThreadPool(4));
+        server.start();
+        System.out.println("TheAlgorithms/Java preview harness listening on http://0.0.0.0:" + PORT + " (" + DEMOS.size() + " demos)");
+    }
+
+    private static void handleRoot(HttpExchange exchange) throws IOException {
+        if (!"/".equals(exchange.getRequestURI().getPath())) {
+            respond(exchange, 404, "text/plain; charset=utf-8", "Not found");
+            return;
+        }
+        respond(exchange, 200, "text/html; charset=utf-8", page());
+    }
+
+    private static void handleRun(HttpExchange exchange) throws IOException {
+        String id = parseQuery(exchange.getRequestURI()).getOrDefault("algo", "");
+        Demo demo = null;
+        for (Demo candidate : DEMOS) {
+            if (candidate.id().equals(id)) {
+                demo = candidate;
+            }
+        }
+        if (demo == null) {
+            respondJson(exchange, 404, "{\"ok\":false,\"error\":\"Unknown algorithm\"}");
+            return;
+        }
+
+        String body;
+        try (InputStream in = exchange.getRequestBody()) {
+            body = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        }
+
+        long started = System.nanoTime();
+        try {
+            String output = demo.run().process(body);
+            double millis = (System.nanoTime() - started) / 1_000_000.0;
+            respondJson(exchange, 200, "{\"ok\":true,\"output\":\"" + escapeJson(output) + "\",\"durationMs\":"
+                    + String.format(Locale.ROOT, "%.2f", millis) + "}");
+        } catch (Exception e) {
+            String message = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            respondJson(exchange, 200, "{\"ok\":false,\"error\":\"" + escapeJson(message) + "\"}");
+        }
+    }
+
+    private static Integer[] parseInts(String input) {
+        String trimmed = input.trim();
+        if (trimmed.isEmpty()) {
+            throw new IllegalArgumentException("Enter at least one number, for example 5, 3, 8");
+        }
+        String[] parts = trimmed.split("[,\\s]+");
+        Integer[] values = new Integer[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            values[i] = Integer.valueOf(parts[i]);
+        }
+        return values;
+    }
+
+    private static String[] splitPair(String input) {
+        String[] parts = input.split("\\|", 2);
+        if (parts.length < 2 || parts[0].isBlank() || parts[1].isBlank()) {
+            throw new IllegalArgumentException("Use two values separated by |, for example 48 | 18");
+        }
+        return new String[] {parts[0].trim(), parts[1].trim()};
+    }
+
+    private static Map<String, String> parseQuery(URI uri) {
+        Map<String, String> values = new LinkedHashMap<>();
+        String query = uri.getRawQuery();
+        if (query == null || query.isEmpty()) {
+            return values;
+        }
+        for (String pair : query.split("&")) {
+            int separator = pair.indexOf('=');
+            if (separator <= 0) {
+                continue;
+            }
+            values.put(URLDecoder.decode(pair.substring(0, separator), StandardCharsets.UTF_8),
+                URLDecoder.decode(pair.substring(separator + 1), StandardCharsets.UTF_8));
+        }
+        return values;
+    }
+
+    private static void respondJson(HttpExchange exchange, int status, String json) throws IOException {
+        respond(exchange, status, "application/json; charset=utf-8", json);
+    }
+
+    private static void respond(HttpExchange exchange, int status, String contentType, String body) throws IOException {
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        exchange.getResponseHeaders().set("Content-Type", contentType);
+        exchange.getResponseHeaders().set("Cache-Control", "no-store");
+        exchange.sendResponseHeaders(status, bytes.length);
+        try (OutputStream out = exchange.getResponseBody()) {
+            out.write(bytes);
+        }
+    }
+
+    private static String escapeJson(String value) {
+        StringBuilder escaped = new StringBuilder(value.length() + 16);
+        for (char c : value.toCharArray()) {
+            switch (c) {
+                case '"' -> escaped.append("\\\"");
+                case '\\' -> escaped.append("\\\\");
+                case '\n' -> escaped.append("\\n");
+                case '\r' -> escaped.append("\\r");
+                case '\t' -> escaped.append("\\t");
+                default -> escaped.append(c < 0x20 ? ' ' : c);
+            }
+        }
+        return escaped.toString();
+    }
+
+    private static String escapeHtml(String value) {
+        return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    private static String page() {
+        StringBuilder cards = new StringBuilder();
+        for (Demo demo : DEMOS) {
+            cards.append("<article class=\"card\" data-algo=\"").append(demo.id()).append("\">")
+                .append("<h2>").append(escapeHtml(demo.title())).append("</h2>")
+                .append("<p class=\"source\">").append(escapeHtml(demo.source())).append("</p>")
+                .append("<p class=\"desc\">").append(escapeHtml(demo.description())).append("</p>")
+                .append("<label class=\"field\"><span>Input</span><input type=\"text\" spellcheck=\"false\" value=\"")
+                .append(escapeHtml(demo.sample())).append("\"></label>")
+                .append("<div class=\"row\"><button type=\"button\">Run</button><span class=\"time\"></span></div>")
+                .append("<pre class=\"out\">Press Run</pre>")
+                .append("</article>");
+        }
+        return PAGE.replace("{{CARDS}}", cards.toString());
+    }
+
+    private static final String PAGE = """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>TheAlgorithms / Java — live preview</title>
+        <style>
+          :root { color-scheme: dark; }
+          * { box-sizing: border-box; }
+          body { margin: 0; padding: 40px 24px 64px; background: #0b1020; color: #e6edf7;
+                 font-family: system-ui, -apple-system, "Segoe UI", sans-serif; line-height: 1.5; }
+          header { max-width: 1080px; margin: 0 auto 26px; }
+          h1 { font-size: 26px; margin: 0 0 8px; letter-spacing: -0.01em; }
+          .sub { color: #93a4bd; font-size: 14px; margin: 0; max-width: 76ch; }
+          .sub code { background: #141b2d; border: 1px solid #22304a; border-radius: 5px;
+                      padding: 1px 5px; font-size: 12.5px; color: #9fd8c6; }
+          .grid { max-width: 1080px; margin: 0 auto; display: grid; gap: 16px;
+                  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+          .card { background: #141b2d; border: 1px solid #22304a; border-radius: 12px; padding: 16px; }
+          .card h2 { font-size: 16px; margin: 0 0 2px; }
+          .source { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+                    color: #6f86a6; margin: 0 0 8px; word-break: break-all; }
+          .desc { color: #b3c2d6; font-size: 13px; margin: 0 0 12px; min-height: 40px; }
+          .field span { display: block; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.09em;
+                        color: #7d90ac; margin-bottom: 5px; }
+          input { width: 100%; padding: 8px 10px; border-radius: 8px; border: 1px solid #2b3a55;
+                  background: #0e1526; color: #e6edf7; font-size: 13px;
+                  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+          input:focus { outline: 2px solid #2f8f78; outline-offset: 1px; border-color: #2f8f78; }
+          .row { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+          button { background: #1f7a63; color: #f2fffb; border: 0; border-radius: 8px;
+                   padding: 7px 16px; font-size: 13px; font-weight: 600; cursor: pointer; }
+          button:hover { background: #25907a; }
+          button:disabled { opacity: 0.6; cursor: progress; }
+          .time { font-size: 11px; color: #7d90ac; font-variant-numeric: tabular-nums; }
+          .out { margin: 10px 0 0; padding: 10px; border-radius: 8px; background: #0e1526;
+                 border: 1px solid #22304a; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                 font-size: 12.5px; color: #cfe0f4; white-space: pre-wrap; word-break: break-word;
+                 min-height: 42px; }
+          .out.ok { color: #7ee2c3; border-color: #1f5d4f; }
+          .out.err { color: #ffb0a8; border-color: #6b2b2b; }
+          footer { max-width: 1080px; margin: 26px auto 0; color: #6f86a6; font-size: 12px; }
+        </style>
+        </head>
+        <body>
+        <header>
+          <h1>TheAlgorithms / Java — live preview</h1>
+          <p class="sub">Each card calls the real implementation from <code>src/main/java</code> of this repository,
+          compiled with the project's own Maven build and running on JDK 21 in the preview container.
+          Edit an input and press Run.</p>
+        </header>
+        <main class="grid">{{CARDS}}</main>
+        <footer>This repository is a library and ships no server of its own; this page is a sandbox harness.
+        The algorithm sources and their tests are untouched.</footer>
+        <script>
+        for (const card of document.querySelectorAll('.card')) {
+          const input = card.querySelector('input');
+          const button = card.querySelector('button');
+          const out = card.querySelector('.out');
+          const time = card.querySelector('.time');
+          const run = async () => {
+            out.textContent = 'running...';
+            out.className = 'out';
+            time.textContent = '';
+            button.disabled = true;
+            try {
+              const response = await fetch('/api/run?algo=' + encodeURIComponent(card.dataset.algo), {
+                method: 'POST',
+                body: input.value
+              });
+              const data = await response.json();
+              out.textContent = data.ok ? data.output : 'Error: ' + data.error;
+              out.className = 'out ' + (data.ok ? 'ok' : 'err');
+              time.textContent = data.durationMs + ' ms';
+            } catch (error) {
+              out.textContent = 'Request failed: ' + error;
+              out.className = 'out err';
+            } finally {
+              button.disabled = false;
+            }
+          };
+          button.addEventListener('click', run);
+          input.addEventListener('keydown', (event) => { if (event.key === 'Enter') run(); });
+        }
+        </script>
+        </body>
+        </html>
+        """;
+}
